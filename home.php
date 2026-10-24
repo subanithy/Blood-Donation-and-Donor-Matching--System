@@ -2,148 +2,211 @@
 session_start();
 include 'db.php';
 
+// 1. Check if donor is logged in
 if (!isset($_SESSION['user'])) {
     header("Location: login.php");
     exit();
 }
 
-$user_id = $_SESSION['user']['id'];
+$user = $_SESSION['user'];
+$donor_blood_group = trim($user['blood_group'] ?? '');
+$update_message = '';
+$update_error = '';
 
-// Handle Profile, Availability Status & Last Donation Date Update
-if (isset($_POST['update_profile'])) {
-    $full_name          = trim($_POST['full_name']);
-    $phone              = trim($_POST['phone']);
-    $address            = trim($_POST['address']);
-    $status             = trim($_POST['status']);
-    $last_donation_date = !empty($_POST['last_donation_date']) ? $_POST['last_donation_date'] : NULL;
+// 2. Process Last Donation Date Update Form
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_donation_date'])) {
+    $new_date = trim($_POST['last_donation_date']);
+    $user_id  = $user['id'];
 
-    $stmt = $conn->prepare("UPDATE users SET full_name = ?, phone = ?, address = ?, status = ?, last_donation_date = ? WHERE id = ?");
-    $stmt->bind_param("sssssi", $full_name, $phone, $address, $status, $last_donation_date, $user_id);
+    if (!empty($new_date)) {
+        $stmt = $conn->prepare("UPDATE users SET last_donation_date = ? WHERE id = ?");
+        $stmt->bind_param("si", $new_date, $user_id);
 
-    if ($stmt->execute()) {
-        // Refresh session variables
-        $_SESSION['user']['full_name']          = $full_name;
-        $_SESSION['user']['phone']              = $phone;
-        $_SESSION['user']['address']            = $address;
-        $_SESSION['user']['status']             = $status;
-        $_SESSION['user']['last_donation_date'] = $last_donation_date;
-        header("Location: home.php");
-        exit();
+        if ($stmt->execute()) {
+            $lastDonationTimestamp = strtotime($new_date);
+            $daysSinceDonation = floor((time() - $lastDonationTimestamp) / (60 * 60 * 24));
+            $isAvailable = ($daysSinceDonation >= 90);
+
+            $_SESSION['user']['last_donation_date'] = $new_date;
+            $_SESSION['user']['availability_status'] = $isAvailable ? 'Available' : 'Not Available';
+            $_SESSION['user']['last_donation_formatted'] = date('F d, Y', $lastDonationTimestamp);
+
+            $user = $_SESSION['user'];
+            $update_message = "Last donation date updated successfully!";
+        } else {
+            $update_error = "Database Error: Failed to update record.";
+        }
+    } else {
+        $update_error = "Please select a valid date.";
     }
 }
 
-$user = $_SESSION['user'];
+$availability_status = $user['availability_status'] ?? 'Available';
+$last_donation_formatted = $user['last_donation_formatted'] ?? 'No Prior History';
+
+// 3. Query blood requests with flexible blood group matching
+$requests_result = false;
+if (!empty($donor_blood_group)) {
+    $clean_bg = str_replace(' ', '', $donor_blood_group);
+    $stmt = $conn->prepare("SELECT * FROM blood_requests WHERE REPLACE(blood_group, ' ', '') = ? ORDER BY id DESC");
+    if ($stmt) {
+        $stmt->bind_param("s", $clean_bg);
+        $stmt->execute();
+        $requests_result = $stmt->get_result();
+    }
+}
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Donor Home Dashboard</title>
+    <title>Donor Dashboard - Blood Bank</title>
     <style>
-        body { font-family: Arial, sans-serif; background-color: #f4f6f9; margin: 0; padding: 0; }
-        .navbar { background-color: #2599e1; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
-        .navbar h2 { margin: 0; }
-        .logout-btn { color: black; text-decoration: none; border: 1px solid white; padding: 6px 12px; border-radius: 4px; font-weight: bold; }
-        .logout-btn:hover { background-color: white; color: #218d9b; }
-        .container { max-width: 600px; margin: 40px auto; background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); text-align: center; position: relative; }
-        .blood-badge { background-color: #17efd6; color: white; font-size: 24px; font-weight: bold; padding: 8px 18px; border-radius: 50px; display: inline-block; margin-bottom: 10px; }
-        .status-available { color: #3f0671; font-weight: bold; }
-        .status-unavailable { color: #926de2; font-weight: bold; }
-        .btn-edit { background-color: #ffc107; color: #333; padding: 10px 20px; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; margin-top: 15px; font-size: 15px; }
-        .btn-edit:hover { background-color: #e0a800; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f9ff; margin: 0; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); margin-bottom: 20px; border: 1px solid #bae6fd; }
+        .header { display: flex; justify-content: space-between; align-items: center; background: linear-gradient(135deg, #0284c7, #2563eb); color: white; padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; }
+        .header h2 { margin: 0; font-size: 20px; }
+        .header a { color: white; background: rgba(255,255,255,0.2); padding: 8px 12px; border-radius: 5px; text-decoration: none; font-weight: bold; }
         
-        /* Modal Styles */
-        .modal { display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); }
-        .modal-content { background-color: #fff; margin: 5% auto; padding: 20px; border-radius: 8px; width: 90%; max-width: 450px; text-align: left; }
-        .modal-content h3 { margin-top: 0; color: #2599e1; }
-        .form-group { margin-bottom: 12px; }
-        .form-group label { display: block; font-weight: bold; margin-bottom: 5px; }
-        .form-group input, .form-group textarea, .form-group select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        .modal-actions { text-align: right; margin-top: 15px; }
-        .btn-save { background-color: #2599e1; color: white; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; cursor: pointer; }
-        .btn-cancel { background-color: #6c757d; color: white; border: none; padding: 8px 15px; border-radius: 4px; font-weight: bold; cursor: pointer; margin-right: 5px; }
+        /* Profile Layout */
+        .profile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 15px; }
+        .profile-item { background: #f8fafc; padding: 12px 15px; border-radius: 6px; border: 1px solid #e2e8f0; }
+        .profile-item label { display: block; font-size: 11px; color: #64748b; text-transform: uppercase; font-weight: 700; margin-bottom: 4px; }
+        .profile-item span { font-size: 14px; font-weight: 600; color: #0f172a; }
+
+        /* Badges */
+        .badge { background: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: bold; display: inline-block; }
+        .badge-urgent { background: #fee2e2; color: #991b1b; }
+        .badge-status-available { background: #dcfce7; color: #15803d; border: 1px solid #86efac; }
+        .badge-status-unavailable { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+
+        /* Form */
+        .update-form { display: flex; gap: 10px; align-items: center; max-width: 450px; margin-top: 10px; }
+        .update-form input[type="date"] { padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; flex: 1; outline: none; }
+        .btn-update { background: #0284c7; color: white; border: none; padding: 9px 16px; border-radius: 6px; font-weight: bold; font-size: 14px; cursor: pointer; }
+        
+        /* Alerts */
+        .alert-success { background: #dcfce7; color: #15803d; border: 1px solid #86efac; padding: 10px 15px; border-radius: 6px; font-size: 14px; margin-bottom: 10px; font-weight: 600; }
+        .alert-error { background: #fee2e2; color: #991b1b; border: 1px solid #fca5a5; padding: 10px 15px; border-radius: 6px; font-size: 14px; margin-bottom: 10px; font-weight: 600; }
+
+        /* Table */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e2e8f0; font-size: 14px; }
+        th { background: #f8fafc; color: #475569; }
+        .btn-respond { background: #16a34a; color: white; padding: 6px 12px; text-decoration: none; border-radius: 4px; font-size: 13px; font-weight: bold; display: inline-block; }
     </style>
 </head>
 <body>
 
-<div class="navbar">
-    <h2>Blood Donation System</h2>
-    <a href="logout.php" class="logout-btn">Logout</a>
-</div>
-
 <div class="container">
-    <div class="blood-badge"><?= htmlspecialchars($user['blood_group']) ?></div>
-    <h2>Welcome, <?= htmlspecialchars($user['full_name']) ?></h2>
-    <p style="color: #6c757d;"><?= htmlspecialchars($user['email']) ?> | <?= htmlspecialchars($user['phone']) ?></p>
-    <p style="color: #6c757d;">Address: <?= htmlspecialchars($user['address'] ?? 'No address provided') ?></p>
-    <hr>
-    
-    <p>Current Availability Status: 
-        <span class="<?= $user['status'] == 'Available' ? 'status-available' : 'status-unavailable' ?>">
-            <?= htmlspecialchars($user['status']) ?>
-        </span>
-    </p>
+    <div class="header">
+        <h2>Welcome, <?= htmlspecialchars($user['full_name']) ?>!</h2>
+        <a href="logout.php">Logout</a>
+    </div>
 
-    <p><strong>Last Donation Date:</strong> 
-        <?= !empty($user['last_donation_date']) ? htmlspecialchars($user['last_donation_date']) : '<em>Never / Not Recorded</em>' ?>
-    </p>
+    <!-- Profile Summary -->
+    <div class="card">
+        <h3 style="margin-top:0; color:#0f172a;">Donor Profile Summary</h3>
+        <div class="profile-grid">
+            <div class="profile-item">
+                <label>Email Address</label>
+                <span><?= htmlspecialchars($user['email']) ?></span>
+            </div>
+            <div class="profile-item">
+                <label>Blood Group</label>
+                <span class="badge"><?= htmlspecialchars($donor_blood_group ?: 'Not Specified') ?></span>
+            </div>
+            <div class="profile-item">
+                <label>Availability Status</label>
+                <?php if ($availability_status === 'Available'): ?>
+                    <span class="badge badge-status-available">🟢 Available to Donate</span>
+                <?php else: ?>
+                    <span class="badge badge-status-unavailable">🔴 Not Available (Cooldown)</span>
+                <?php endif; ?>
+            </div>
+            <div class="profile-item">
+                <label>Last Donation Date</label>
+                <span><?= htmlspecialchars($last_donation_formatted) ?></span>
+            </div>
+        </div>
+    </div>
 
-    <button type="button" class="btn-edit" onclick="openModal()">Edit Profile</button>
-</div>
+    <!-- Update Date Form -->
+    <div class="card">
+        <h3 style="margin-top:0; color:#0f172a;">Update Last Donation Date</h3>
+        
+        <?php if ($update_message): ?>
+            <div class="alert-success"><?= htmlspecialchars($update_message) ?></div>
+        <?php endif; ?>
 
-<!-- Edit Profile Modal -->
-<div id="editModal" class="modal">
-    <div class="modal-content">
-        <h3>Edit Profile Details</h3>
-        <form action="home.php" method="POST">
-            <div class="form-group">
-                <label>Full Name:</label>
-                <input type="text" name="full_name" value="<?= htmlspecialchars($user['full_name']) ?>" required>
-            </div>
-            <div class="form-group">
-                <label>Phone Number:</label>
-                <input type="tel" name="phone" value="<?= htmlspecialchars($user['phone']) ?>" required>
-            </div>
-            <div class="form-group">
-                <label>Address:</label>
-                <textarea name="address" rows="3" required><?= htmlspecialchars($user['address'] ?? '') ?></textarea>
-            </div>
-            <div class="form-group">
-                <label>Availability Status:</label>
-                <select name="status" required>
-                    <option value="Available" <?= $user['status'] === 'Available' ? 'selected' : '' ?>>Available</option>
-                    <option value="Unavailable" <?= $user['status'] === 'Unavailable' ? 'selected' : '' ?>>Unavailable</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Last Donation Date:</label>
-                <input type="date" name="last_donation_date" value="<?= htmlspecialchars($user['last_donation_date'] ?? '') ?>">
-            </div>
-            <div class="modal-actions">
-                <button type="button" class="btn-cancel" onclick="closeModal()">Cancel</button>
-                <button type="submit" name="update_profile" class="btn-save">Save Changes</button>
-            </div>
+        <?php if ($update_error): ?>
+            <div class="alert-error"><?= htmlspecialchars($update_error) ?></div>
+        <?php endif; ?>
+
+        <form method="POST" action="home.php" class="update-form">
+            <input 
+                type="date" 
+                name="last_donation_date" 
+                max="<?= date('Y-m-d') ?>" 
+                value="<?= htmlspecialchars($user['last_donation_date'] ?? '') ?>" 
+                required
+            >
+            <button type="submit" name="update_donation_date" class="btn-update">
+                Save Date
+            </button>
         </form>
     </div>
+
+    <!-- Matching Blood Requests -->
+    <div class="card">
+        <h3 style="color: #0284c7; margin-top:0;">🚨 Urgent Requests Matching Your Blood Group (<?= htmlspecialchars($donor_blood_group ?: 'N/A') ?>)</h3>
+        
+        <?php if ($requests_result && $requests_result->num_rows > 0): ?>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Patient</th>
+                        <th>Hospital</th>
+                        <th>Units</th>
+                        <th>Urgency / Status</th>
+                        <th>Contact</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($req = $requests_result->fetch_assoc()): ?>
+                        <?php 
+                            // Automatic Fallback Matching for Column Names
+                            $patient  = $req['patient_name'] ?? $req['patient'] ?? $req['name'] ?? $req['full_name'] ?? 'N/A';
+                            $hospital = $req['hospital_name'] ?? $req['hospital'] ?? $req['location'] ?? 'N/A';
+                            $units    = $req['units_needed'] ?? $req['units'] ?? $req['quantity'] ?? '1';
+                            $urgency  = $req['urgency_level'] ?? $req['urgency'] ?? $req['status'] ?? 'Urgent';
+                            $phone    = $req['contact_phone'] ?? $req['phone'] ?? $req['contact'] ?? $req['mobile'] ?? '';
+                        ?>
+                        <tr>
+                            <td><b><?= htmlspecialchars($patient) ?></b></td>
+                            <td><?= htmlspecialchars($hospital) ?></td>
+                            <td><?= htmlspecialchars($units) ?> Unit(s)</td>
+                            <td><span class="badge badge-urgent"><?= htmlspecialchars($urgency) ?></span></td>
+                            <td><?= htmlspecialchars($phone ?: 'N/A') ?></td>
+                            <td>
+                                <?php if (!empty($phone)): ?>
+                                    <a href="tel:<?= htmlspecialchars($phone) ?>" class="btn-respond">Contact / Donate</a>
+                                <?php else: ?>
+                                    <span style="color: #94a3b8;">No phone</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        <?php else: ?>
+            <p style="color: #64748b; margin-bottom: 0;">No active requests found matching blood group <b><?= htmlspecialchars($donor_blood_group ?: 'N/A') ?></b> in the database.</p>
+        <?php endif; ?>
+    </div>
 </div>
-
-<script>
-function openModal() {
-    document.getElementById('editModal').style.display = 'block';
-}
-
-function closeModal() {
-    document.getElementById('editModal').style.display = 'none';
-}
-
-window.onclick = function(event) {
-    const modal = document.getElementById('editModal');
-    if (event.target === modal) {
-        closeModal();
-    }
-}
-</script>
 
 </body>
 </html>
